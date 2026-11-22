@@ -420,6 +420,28 @@ function detectSplit(ctx,w,h){
   if(avg<6||minV>avg*.38)return null; // no clean, confident gutter -> not a spread
   return{x:minX};
 }
+/* Finds the real page content inside a split half, so a slightly off gutter cut (a sliver of blank space left
+   on the inner edge) doesn't throw off the centring. Returns null on an essentially blank page, where there's
+   nothing reliable to centre on and the full crop is kept as-is. */
+function contentBounds(ctx,w,h){
+  const d=ctx.getImageData(0,0,w,h).data;
+  const colProf=new Float64Array(w),rowProf=new Float64Array(h);
+  for(let y=0;y<h;y++){const row=y*w;
+    for(let x=0;x<w;x++){const i=(row+x)*4,ink=255-(d[i]+d[i+1]+d[i+2])/3;colProf[x]+=ink;rowProf[y]+=ink}}
+  const colSm=boxBlur1D(colProf,w,Math.max(2,Math.round(w*.006))),rowSm=boxBlur1D(rowProf,h,Math.max(2,Math.round(h*.006)));
+  let colMax=0;for(let x=0;x<w;x++)if(colSm[x]>colMax)colMax=colSm[x];
+  let rowMax=0;for(let y=0;y<h;y++)if(rowSm[y]>rowMax)rowMax=rowSm[y];
+  if(colMax<4||rowMax<4)return null;
+  const colT=colMax*.025,rowT=rowMax*.025;
+  let x0=0,x1=w-1,y0=0,y1=h-1;
+  while(x0<x1&&colSm[x0]<colT)x0++;
+  while(x1>x0&&colSm[x1]<colT)x1--;
+  while(y0<y1&&rowSm[y0]<rowT)y0++;
+  while(y1>y0&&rowSm[y1]<rowT)y1--;
+  const mx=Math.round(w*.02),my=Math.round(h*.02);
+  x0=Math.max(0,x0-mx);x1=Math.min(w-1,x1+mx);y0=Math.max(0,y0-my);y1=Math.min(h-1,y1+my);
+  return{x0,y0,x1,y1};
+}
 const A4_PORTRAIT=595.28/841.89;
 /* Pads a page out to A4 (in whichever orientation it already is) without cropping or stretching the content:
    the original pixels are centred and the new margin is filled by stretching the page's own edge pixels
@@ -531,6 +553,7 @@ async function processFile(f){
   try{
     pdf=await pdfjsLib.getDocument({data:await f.file.arrayBuffer()}).promise;
     f.pages=pdf.numPages;renderProgress(); // source page count, used for progress while running
+    let outIdx=0; // explicit counter: f.out can only ever grow by exactly 1 slot at a time
     for(let n=1;n<=f.pages;n++){
       if(cancelled)return false;
       const {c,ctx,w,h}=await renderPdfPage(pdf,n,PROFILE.max);
@@ -542,18 +565,31 @@ async function processFile(f){
         const sctx=sub.getContext('2d',{willReadFrequently:true});
         const img=sctx.getImageData(0,0,sub.width,sub.height);
         processImage(img,sub.width,sub.height);sctx.putImageData(img,0,0);
-        let finalCanvas=sub,fit=null;
-        if(spl){const r=fitToA4(sub);finalCanvas=r.canvas;fit={dxFrac:r.dxFrac,dyFrac:r.dyFrac,cwFrac:r.cwFrac,chFrac:r.chFrac}}
+        let working=sub,xFrac0=part.x0/c.width,xFrac1=part.x1/c.width;
+        if(spl){
+          // trim away any blank sliver the gutter cut left on the inner edge, so the real page
+          // content — not the raw, possibly lopsided crop — is what gets centred on A4
+          const cb=contentBounds(sctx,sub.width,sub.height);
+          if(cb&&(cb.x1-cb.x0+1<sub.width||cb.y1-cb.y0+1<sub.height)){
+            const trimmed=sliceCanvas(sub,cb.x0,cb.y0,cb.x1-cb.x0+1,cb.y1-cb.y0+1);
+            xFrac0=(part.x0+cb.x0)/c.width;xFrac1=(part.x0+cb.x0+(cb.x1-cb.x0+1))/c.width;
+            sub.width=sub.height=0;working=trimmed;
+          }
+        }
+        let finalCanvas=working,fit=null;
+        if(spl){const r=fitToA4(working);finalCanvas=r.canvas;fit={dxFrac:r.dxFrac,dyFrac:r.dyFrac,cwFrac:r.cwFrac,chFrac:r.chFrac}}
         const blob=await toBlob(finalCanvas,PROFILE.q);
-        const idx=f.out.length+1,wPt=(part.x1-part.x0)*ptPerPx,hPt=h;
+        outIdx++;const idx=outIdx,wPt=working.width*ptPerPx,hPt=working.height*ptPerPx;
         f.out[idx]=blob;
         f.sizes[idx]=[Math.round((fit?wPt/fit.cwFrac:wPt)*100)/100,Math.round((fit?hPt/fit.chFrac:hPt)*100)/100];
-        f.map[idx]={src:n,xFrac0:part.x0/c.width,xFrac1:part.x1/c.width,fit};
-        f.outSize+=blob.size;finalCanvas.width=finalCanvas.height=0;
+        f.map[idx]={src:n,xFrac0,xFrac1,fit};
+        f.outSize+=blob.size;
+        if(working!==finalCanvas)working.width=working.height=0;
+        finalCanvas.width=finalCanvas.height=0;
       }
       c.width=c.height=0;f.done=n;renderProgress();await tick();
     }
-    f.pages=f.out.length; // final output page count (can exceed source pages once spreads are split)
+    f.pages=outIdx; // final output page count (can exceed source pages once spreads are split)
     f.done=f.pages;
     f.status='ok';
   }catch(e){console.error(e);f.status='err';f.err=e&&e.name==='PasswordException'?'Password-protected PDF':'Could not read this PDF'}
