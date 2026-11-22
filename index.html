@@ -385,7 +385,7 @@ function processImage(img,w,h,bgf){
 }
 const toBlob=(c,q)=>new Promise(r=>c.toBlob(r,'image/jpeg',q));
 
-/* ---------- spread splitting + A4 fit ---------- */
+/* ---------- spread splitting + page fit ---------- */
 function sliceCanvas(src,x,y,w,h){
   const c=document.createElement('canvas');c.width=w;c.height=h;
   c.getContext('2d').drawImage(src,x,y,w,h,0,0,w,h);
@@ -397,28 +397,93 @@ function boxBlur1D(arr,w,win){
   for(let x=0;x<w;x++){const a=Math.max(0,x-win),b=Math.min(w-1,x+win);out[x]=(pre[b+1]-pre[a])/(b-a+1)}
   return out;
 }
-/* Detects a two-page spread and finds the gutter between the pages. The gutter is wherever the central band
-   of the scan is most consistently blank (least ink), which is not assumed to sit exactly in the middle —
-   raw scans are rarely perfectly centred — so a wide band is searched and the clearest, most blank column wins.
-   A page is only ever split when there's real evidence of a gutter; otherwise it's left as a single page. */
-function detectSplit(ctx,w,h){
-  if(w/h<1.12)return null; // single pages aren't this wide; only wide scans can be spreads
-  const d=ctx.getImageData(0,0,w,h).data;
-  const y0=Math.max(0,Math.round(h*.03)),y1=Math.min(h,Math.round(h*.97));
-  const prof=new Float64Array(w);let rows=0;
-  for(let y=y0;y<y1;y+=2){const row=y*w;for(let x=0;x<w;x++){const i=(row+x)*4;prof[x]+=255-(d[i]+d[i+1]+d[i+2])/3}rows++}
-  if(!rows)return null;
-  for(let x=0;x<w;x++)prof[x]/=rows;
-  const sm=boxBlur1D(prof,w,Math.max(2,Math.round(w*.004)));
-  const lo=Math.round(w*.30),hi=Math.round(w*.70);
-  let minV=Infinity,minX=-1;
-  for(let x=lo;x<=hi;x++)if(sm[x]<minV){minV=sm[x];minX=x}
-  if(minX<0)return null;
-  const margin=Math.round(w*.08);let s=0,c=0;
-  for(let x=0;x<w;x++){if(Math.abs(x-minX)<margin)continue;s+=sm[x];c++}
-  const avg=c?s/c:0;
-  if(avg<6||minV>avg*.38)return null; // no clean, confident gutter -> not a spread
-  return{x:minX};
+/* Per-column ink statistics for gutter finding. "Ink" is a pixel clearly darker than the paper in its brightest
+   channel; a pale coloured watermark only dims some channels, so it never counts as ink however heavy it is.
+   dens[x] = share of rows that have ink in column x.
+   run[x]  = longest unbroken vertical ink streak as a share of the height — this is what tells a page-edge line or
+             binding shadow (tall streak) apart from ordinary text (short streaks). */
+function columnStats(d,w,h){
+  const hist=new Uint32Array(256);let n=0;
+  for(let y=0;y<h;y+=4){let i=y*w*4;for(let x=0;x<w;x+=4,i+=16){const r=d[i],g=d[i+1],b=d[i+2];hist[r>g?(r>b?r:b):(g>b?g:b)]++;n++}}
+  let acc=0,P=255;for(let k=0;k<256;k++){acc+=hist[k];if(acc>=n*.7){P=k;break}}
+  const thr=Math.max(P,110)*.7,y0=Math.round(h*.03),y1=Math.round(h*.97),rows=Math.max(1,y1-y0),G=Math.max(2,Math.round(h*.004));
+  const dens=new Float64Array(w),run=new Float64Array(w),cur=new Int32Array(w),gap=new Int32Array(w);
+  for(let y=y0;y<y1;y++){let i=y*w*4;
+    for(let x=0;x<w;x++,i+=4){const r=d[i],g=d[i+1],b=d[i+2],m=r>g?(r>b?r:b):(g>b?g:b);
+      if(m<thr){dens[x]++;cur[x]+=1+gap[x];gap[x]=0;if(cur[x]>run[x])run[x]=cur[x]}
+      else if(cur[x]&&++gap[x]>G){cur[x]=0;gap[x]=0}}}
+  for(let x=0;x<w;x++){dens[x]/=rows;run[x]/=rows}
+  return{dens,run};
+}
+/* Detects a two-page spread and works out where to cut it. Returns {a,b}: the left page is columns [0,a) and the
+   right page is [b+1,w), so anything in between (the gutter) is thrown away. Returns null for a single page.
+   What a gutter looks like varies from scan to scan, so three things are recognised:
+     - a blank band (the usual case; cut through its middle, not at its edge)
+     - a tall dark line or shadow where the pages meet, with or without blank paper beside it (cut it out entirely)
+     - a blank page in the spread (one half has no ink at all): cut at the middle of the blank run
+   Narrow-format books give spreads that are barely wider than tall (~1.05), so the aspect gate is low and
+   near-square scans have to show a clean, central gutter. opt.lenient is set when other pages of the same size in
+   this PDF were already split: such a page is a spread too, so it is split even when its own evidence is thin. */
+function detectSplit(ctx,w,h,opt){
+  const ratio=w/h,lenient=!!(opt&&opt.lenient);
+  if(ratio<1.0)return null; // portrait pages are never spreads
+  const strict=!lenient&&ratio<1.2;
+  const {dens,run}=columnStats(ctx.getImageData(0,0,w,h).data,w,h);
+  const sm=boxBlur1D(dens,w,Math.max(1,Math.round(w*.0025))),mid=Math.round(w/2);
+  let s=0,c=0;for(let x=0;x<w;x++)if(sm[x]>.02){s+=sm[x];c++}
+  const typ=c>w*.08?s/c:0; // typical ink density of the columns that have any content
+  const cut=x=>({a:x,b:x-1}); // a single cut, nothing discarded
+  if(!typ)return lenient?cut(mid):null;
+  const has=(a,b)=>{let n=0;for(let x=a;x<b;x++)if(sm[x]>.02)n++;return n>=Math.max(6,(b-a)*.08)}; // side has real content
+  // tall dark streaks near the middle: page-edge lines / binding shadows (bridging 1px breaks)
+  const bands=[];
+  for(let x=Math.round(w*.2),xe=Math.round(w*.8);x<xe;){
+    if(run[x]<.75){x++;continue}
+    let e=x,pk=run[x];while(e+1<w&&(run[e+1]>=.75||run[e+2]>=.75)){e++;if(run[e]>pk)pk=run[e]}
+    if(e-x+1<=w*.12){ // the line's soft edges are shorter streaks than its core; take them too so no fringe is left on a page
+      let lo2=x,hi2=e;for(let k=0;k<8&&lo2>0&&run[lo2-1]>=.3;k++)lo2--;for(let k=0;k<8&&hi2<w-1&&run[hi2+1]>=.3;k++)hi2++;
+      bands.push({lo:lo2,hi:hi2,pk});
+    }
+    x=e+1;
+  }
+  // blank runs: the candidate nearest the middle of the scan wins (widest on a tie)
+  const lo=Math.round(w*(strict?.38:.30)),hi=Math.round(w*(strict?.62:.70)),Tb=Math.max(.02,Math.min(.3*typ,.08)),minRun=Math.max(2,Math.round(w*.003));
+  let blank=null;
+  for(let x=0;x<w;){
+    if(sm[x]>Tb){x++;continue}
+    let e=x;while(e+1<w&&sm[e+1]<=Tb)e++;
+    const ra=x,rb=e,edge=ra===0||rb===w-1;x=e+1;
+    if(edge){if(strict||ra>mid||rb<mid||rb-ra+1<w*.3)continue} // only a wholly blank page at the far end counts
+    else if(rb<lo||ra>hi||rb-ra+1<minRun)continue;
+    const width=rb-ra+1,dist=Math.abs(Math.min(Math.max(mid,ra),rb)-mid);
+    if(!blank||dist<blank.dist||(dist===blank.dist&&width>blank.width))blank={ra,rb,dist,width,edge};
+  }
+  let zone=null;
+  if(blank&&(blank.edge?(has(0,blank.ra)||has(blank.rb+1,w)):(has(0,blank.ra)&&has(blank.rb+1,w)))){
+    let {ra:a,rb:b}=blank;
+    if(blank.edge||blank.width>w*.12)zone=cut(Math.min(Math.max(mid,a),b)); // blank page / very wide blank: cut at the middle
+    else{
+      const near=Math.max(6,Math.round(w*.03));
+      for(const bd of bands)if(bd.hi>=a-near&&bd.lo<=b+near){a=Math.min(a,bd.lo);b=Math.max(b,bd.hi)}
+      zone=(a===blank.ra&&b===blank.rb)?cut(Math.round((a+b)/2)):{a,b};
+    }
+  }
+  // no blank gutter at all (tightly cropped pages): a tall dark line close to the middle is the page edge
+  if(!zone){
+    let best=null;
+    for(const bd of bands){
+      const dist=Math.abs((bd.lo+bd.hi)/2-mid);
+      if(bd.pk<(strict?.9:.85)||dist>w*(strict?.08:.1)||!has(0,bd.lo)||!has(bd.hi+1,w))continue;
+      if(!best||dist<best.dist)best={a:bd.lo,b:bd.hi,dist};
+    }
+    if(best)zone={a:best.a,b:best.b};
+  }
+  if(!zone&&lenient){ // same size as pages already split here: take the clearest dip near the middle, else the middle
+    let mx=mid,mv=Infinity;for(let x=Math.round(w*.4);x<=Math.round(w*.6);x++)if(sm[x]<mv){mv=sm[x];mx=x}
+    zone=cut(mv<=.6*typ?mx:mid);
+  }
+  if(!zone||zone.a<w*.15||zone.b>w*.85)return null;
+  return zone;
 }
 /* Finds the real page content inside a split half, so a slightly off gutter cut (a sliver of blank space left
    on the inner edge) doesn't throw off the centring. Returns null on an essentially blank page, where there's
@@ -442,25 +507,39 @@ function contentBounds(ctx,w,h){
   x0=Math.max(0,x0-mx);x1=Math.min(w-1,x1+mx);y0=Math.max(0,y0-my);y1=Math.min(h-1,y1+my);
   return{x0,y0,x1,y1};
 }
-const A4_PORTRAIT=595.28/841.89;
-/* Pads a page out to A4 (in whichever orientation it already is) without cropping or stretching the content:
-   the original pixels are centred and the new margin is filled by stretching the page's own edge pixels
-   outward, so an off-size split half blends into plain paper-coloured border instead of a bare white strip. */
-function fitToA4(canvas){
-  const w=canvas.width,h=canvas.height,target=w>h*1.05?1/A4_PORTRAIT:A4_PORTRAIT,cur=w/h;
-  if(Math.abs(cur-target)/target<.015)return{canvas,dxFrac:0,dyFrac:0,cwFrac:1,chFrac:1};
-  let outW=w,outH=h;
-  if(cur>target)outH=Math.round(w/target);else outW=Math.round(h*target);
-  const out=document.createElement('canvas');out.width=outW;out.height=outH;
-  const o=out.getContext('2d'),dx=Math.round((outW-w)/2),dy=Math.round((outH-h)/2);
-  if(dy>0){o.drawImage(canvas,0,0,w,1,dx,0,w,dy);o.drawImage(canvas,0,h-1,w,1,dx,dy+h,w,outH-dy-h)}
-  if(dx>0){o.drawImage(canvas,0,0,1,h,0,dy,dx,h);o.drawImage(canvas,w-1,0,1,h,dx+w,dy,outW-dx-w,h)}
-  if(dx>0&&dy>0){
-    o.drawImage(canvas,0,0,1,1,0,0,dx,dy);o.drawImage(canvas,w-1,0,1,1,dx+w,0,outW-dx-w,dy);
-    o.drawImage(canvas,0,h-1,1,1,0,dy+h,dx,outH-dy-h);o.drawImage(canvas,w-1,h-1,1,1,dx+w,dy+h,outW-dx-w,outH-dy-h);
-  }
-  o.drawImage(canvas,dx,dy);
-  return{canvas:out,dxFrac:dx/outW,dyFrac:dy/outH,cwFrac:w/outW,chFrac:h/outH};
+const A4PT={w:595.28,h:841.89};
+/* One page size for the whole output, so a split half and an untouched single page come out identical in size.
+   It's A4 unless the single pages already in the PDF are clearly a different shape (then their own size is kept).
+   Wide pages (spreads, landscape sheets) don't vote; they're laid out on this same size in landscape if needed. */
+async function pickTargetSize(pdf){
+  try{
+    const tally=new Map();
+    for(let n=1;n<=pdf.numPages;n++){
+      const p=await pdf.getPage(n),v=p.getViewport({scale:1});p.cleanup();
+      if(v.width/v.height>=1.05)continue;
+      const k=Math.round(v.width/6)+'x'+Math.round(v.height/6),t=tally.get(k)||{n:0,w:v.width,h:v.height};
+      t.n++;tally.set(k,t);
+    }
+    let best=null;for(const t of tally.values())if(!best||t.n>best.n)best=t;
+    if(!best)return A4PT;
+    return Math.abs(best.w/best.h/(A4PT.w/A4PT.h)-1)<=.08?A4PT:{w:best.w,h:best.h};
+  }catch(e){return A4PT}
+}
+/* Lays one page's content onto a page of the target size without scaling or cropping it: columns [cx0,cx0+cw) of
+   src are centred on a white canvas of the target's proportions. nom is the width the page is nominally meant to
+   occupy (half a spread, or the whole width of a single page); both halves of a spread share it so they end up at
+   the same scale. Returns the canvas, its size in points, and where the content sits (for the before/after preview). */
+function composePage(src,cx0,cw,nom,T){
+  const H=src.height,wide=Math.max(nom,cw),land=wide/H>1.05;
+  const pw=land?T.h:T.w,ph=land?T.w:T.h,ra=pw/ph,size=[Math.round(pw*100)/100,Math.round(ph*100)/100];
+  let OW=wide,OH=H;
+  if(OW/OH>ra)OH=Math.round(OW/ra);else OW=Math.round(OH*ra);
+  if(cx0===0&&cw===src.width&&OW-cw<=OW*.012&&OH-H<=OH*.012)return{canvas:src,size,fit:null}; // already the right shape
+  const out=document.createElement('canvas');out.width=OW;out.height=OH;
+  const o=out.getContext('2d'),dx=Math.round((OW-cw)/2),dy=Math.round((OH-H)/2);
+  o.fillStyle='#fff';o.fillRect(0,0,OW,OH);
+  o.drawImage(src,cx0,0,cw,H,dx,dy,cw,H);
+  return{canvas:out,size,fit:{dxFrac:dx/OW,dyFrac:dy/OH,cwFrac:cw/OW,chFrac:H/OH}};
 }
 
 async function nativeScale(page,v1){
@@ -554,38 +633,36 @@ async function processFile(f){
     pdf=await pdfjsLib.getDocument({data:await f.file.arrayBuffer()}).promise;
     f.pages=pdf.numPages;renderProgress(); // source page count, used for progress while running
     let outIdx=0; // explicit counter: f.out can only ever grow by exactly 1 slot at a time
+    const T=await pickTargetSize(pdf),seen=[]; // T: the one page size every output page gets
     for(let n=1;n<=f.pages;n++){
       if(cancelled)return false;
       const {c,ctx,w,h}=await renderPdfPage(pdf,n,PROFILE.max);
-      const ptPerPx=w/c.width;
-      const spl=detectSplit(ctx,c.width,c.height);
-      const parts=spl?[{x0:0,x1:spl.x},{x0:spl.x,x1:c.width}]:[{x0:0,x1:c.width}];
+      // pages of the same size that were already split here are spreads too, so be more willing to split this one
+      const same=seen.filter(q=>Math.abs(q.w/w-1)<.04&&Math.abs(q.h/h-1)<.04),yes=same.filter(q=>q.split).length;
+      const spl=detectSplit(ctx,c.width,c.height,{lenient:yes>0&&yes>=same.length-yes});
+      seen.push({w,h,split:!!spl});
+      const parts=spl?[{x0:0,x1:spl.a},{x0:spl.b+1,x1:c.width}]:[{x0:0,x1:c.width}];
+      const halves=[];
       for(const part of parts){
         const sub=sliceCanvas(c,part.x0,0,part.x1-part.x0,c.height);
         const sctx=sub.getContext('2d',{willReadFrequently:true});
         const img=sctx.getImageData(0,0,sub.width,sub.height);
         processImage(img,sub.width,sub.height);sctx.putImageData(img,0,0);
-        let working=sub,xFrac0=part.x0/c.width,xFrac1=part.x1/c.width;
-        if(spl){
-          // trim away any blank sliver the gutter cut left on the inner edge, so the real page
-          // content — not the raw, possibly lopsided crop — is what gets centred on A4
-          const cb=contentBounds(sctx,sub.width,sub.height);
-          if(cb&&(cb.x1-cb.x0+1<sub.width||cb.y1-cb.y0+1<sub.height)){
-            const trimmed=sliceCanvas(sub,cb.x0,cb.y0,cb.x1-cb.x0+1,cb.y1-cb.y0+1);
-            xFrac0=(part.x0+cb.x0)/c.width;xFrac1=(part.x0+cb.x0+(cb.x1-cb.x0+1))/c.width;
-            sub.width=sub.height=0;working=trimmed;
-          }
-        }
-        let finalCanvas=working,fit=null;
-        if(spl){const r=fitToA4(working);finalCanvas=r.canvas;fit={dxFrac:r.dxFrac,dyFrac:r.dyFrac,cwFrac:r.cwFrac,chFrac:r.chFrac}}
-        const blob=await toBlob(finalCanvas,PROFILE.q);
-        outIdx++;const idx=outIdx,wPt=working.width*ptPerPx,hPt=working.height*ptPerPx;
-        f.out[idx]=blob;
-        f.sizes[idx]=[Math.round((fit?wPt/fit.cwFrac:wPt)*100)/100,Math.round((fit?hPt/fit.chFrac:hPt)*100)/100];
-        f.map[idx]={src:n,xFrac0,xFrac1,fit};
+        // find the real page content so a slightly off cut doesn't leave the page lopsided; it is centred below
+        let cx0=0,cw=sub.width;
+        if(spl){const cb=contentBounds(sctx,sub.width,sub.height);if(cb){cx0=cb.x0;cw=cb.x1-cb.x0+1}}
+        halves.push({sub,x0:part.x0,cx0,cw});
+      }
+      const nom=spl?Math.max(c.width/2,...halves.map(p=>p.cw)):c.width;
+      for(const p of halves){
+        const r=composePage(p.sub,p.cx0,p.cw,nom,T);
+        const blob=await toBlob(r.canvas,PROFILE.q);
+        outIdx++;
+        f.out[outIdx]=blob;f.sizes[outIdx]=r.size;
+        f.map[outIdx]={src:n,xFrac0:(p.x0+p.cx0)/c.width,xFrac1:(p.x0+p.cx0+p.cw)/c.width,fit:r.fit};
         f.outSize+=blob.size;
-        if(working!==finalCanvas)working.width=working.height=0;
-        finalCanvas.width=finalCanvas.height=0;
+        if(r.canvas!==p.sub)r.canvas.width=r.canvas.height=0;
+        p.sub.width=p.sub.height=0;
       }
       c.width=c.height=0;f.done=n;renderProgress();await tick();
     }

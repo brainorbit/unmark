@@ -1,6 +1,6 @@
 /* Unmark service worker: offline app shell + cached CDN libraries.
    Bump VERSION on every deploy so installed apps pick up changes. */
-const VERSION = 'unmark-v2';
+const VERSION = 'unmark-v3';
 const CORE = ['./', 'index.html', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png', 'icons/apple-touch-icon.png'];
 const CDN = [
   'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js',
